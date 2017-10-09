@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/private/waiter"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ec2"
 
+	retry "github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 )
 
 type StepRunSourceInstance struct {
@@ -23,8 +25,9 @@ type StepRunSourceInstance struct {
 	Debug                             bool
 	EbsOptimized                      bool
 	ExpectedRootDevice                string
-	InstanceType                      string
 	IamInstanceProfile                string
+	InstanceInitiatedShutdownBehavior string
+	InstanceType                      string
 	SourceAMI                         string
 	SpotPrice                         string
 	SpotPriceProduct                  string
@@ -32,7 +35,7 @@ type StepRunSourceInstance struct {
 	Tags                              map[string]string
 	UserData                          string
 	UserDataFile                      string
-	InstanceInitiatedShutdownBehavior string
+	Ctx                               interpolate.Context
 
 	instanceId  string
 	spotRequest *ec2.SpotInstanceRequest
@@ -40,28 +43,12 @@ type StepRunSourceInstance struct {
 
 func (s *StepRunSourceInstance) Run(state multistep.StateBag) multistep.StepAction {
 	ec2conn := state.Get("ec2").(*ec2.EC2)
-	keyName := state.Get("keyPair").(string)
-	tempSecurityGroupIds := state.Get("securityGroupIds").([]string)
-	ui := state.Get("ui").(packer.Ui)
-
-	securityGroupIds := make([]*string, len(tempSecurityGroupIds))
-	for i, sg := range tempSecurityGroupIds {
-		log.Printf("[DEBUG] Waiting for tempSecurityGroup: %s", sg)
-		err := WaitUntilSecurityGroupExists(ec2conn,
-			&ec2.DescribeSecurityGroupsInput{
-				GroupIds: []*string{aws.String(sg)},
-			},
-		)
-		if err == nil {
-			log.Printf("[DEBUG] Found security group %s", sg)
-			securityGroupIds[i] = aws.String(sg)
-		} else {
-			err := fmt.Errorf("Timed out waiting for security group %s: %s", sg, err)
-			log.Printf("[DEBUG] %s", err.Error())
-			state.Put("error", err)
-			return multistep.ActionHalt
-		}
+	var keyName string
+	if name, ok := state.GetOk("keyPair"); ok {
+		keyName = name.(string)
 	}
+	securityGroupIds := aws.StringSlice(state.Get("securityGroupIds").([]string))
+	ui := state.Get("ui").(packer.Ui)
 
 	userData := s.UserData
 	if s.UserDataFile != "" {
@@ -149,7 +136,23 @@ func (s *StepRunSourceInstance) Run(state multistep.StateBag) multistep.StepActi
 
 	var instanceId string
 
+	ui.Say("Adding tags to source instance")
+	if _, exists := s.Tags["Name"]; !exists {
+		s.Tags["Name"] = "Packer Builder"
+	}
+
+	createTagsAfterInstanceStarts := true
+	ec2Tags, err := ConvertToEC2Tags(s.Tags, *ec2conn.Config.Region, s.SourceAMI, s.Ctx)
+	if err != nil {
+		err := fmt.Errorf("Error tagging source instance: %s", err)
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return multistep.ActionHalt
+	}
+	ReportTags(ui, ec2Tags)
+
 	if spotPrice == "" || spotPrice == "0" {
+
 		runOpts := &ec2.RunInstancesInput{
 			ImageId:             &s.SourceAMI,
 			InstanceType:        &s.InstanceType,
@@ -160,6 +163,16 @@ func (s *StepRunSourceInstance) Run(state multistep.StateBag) multistep.StepActi
 			BlockDeviceMappings: s.BlockDevices.BuildLaunchDevices(),
 			Placement:           &ec2.Placement{AvailabilityZone: &s.AvailabilityZone},
 			EbsOptimized:        &s.EbsOptimized,
+		}
+
+		if len(ec2Tags) > 0 {
+			runTags := &ec2.TagSpecification{
+				ResourceType: aws.String("instance"),
+				Tags:         ec2Tags,
+			}
+
+			runOpts.SetTagSpecifications([]*ec2.TagSpecification{runTags})
+			createTagsAfterInstanceStarts = false
 		}
 
 		if keyName != "" {
@@ -268,6 +281,7 @@ func (s *StepRunSourceInstance) Run(state multistep.StateBag) multistep.StepActi
 			return multistep.ActionHalt
 		}
 		instanceId = *spotResp.SpotInstanceRequests[0].InstanceId
+
 	}
 
 	// Set the instance ID so that the cleanup works properly
@@ -291,19 +305,30 @@ func (s *StepRunSourceInstance) Run(state multistep.StateBag) multistep.StepActi
 
 	instance := latestInstance.(*ec2.Instance)
 
-	ec2Tags := make([]*ec2.Tag, 1, len(s.Tags)+1)
-	ec2Tags[0] = &ec2.Tag{Key: aws.String("Name"), Value: aws.String("Packer Builder")}
-	for k, v := range s.Tags {
-		ec2Tags = append(ec2Tags, &ec2.Tag{Key: aws.String(k), Value: aws.String(v)})
-	}
+	if createTagsAfterInstanceStarts {
+		// Retry creating tags for about 2.5 minutes
+		err = retry.Retry(0.2, 30, 11, func(_ uint) (bool, error) {
+			_, err := ec2conn.CreateTags(&ec2.CreateTagsInput{
+				Tags:      ec2Tags,
+				Resources: []*string{instance.InstanceId},
+			})
+			if err == nil {
+				return true, nil
+			}
+			if awsErr, ok := err.(awserr.Error); ok {
+				if awsErr.Code() == "InvalidInstanceID.NotFound" {
+					return false, nil
+				}
+			}
+			return true, err
+		})
 
-	_, err = ec2conn.CreateTags(&ec2.CreateTagsInput{
-		Tags:      ec2Tags,
-		Resources: []*string{instance.InstanceId},
-	})
-	if err != nil {
-		ui.Message(
-			fmt.Sprintf("Failed to tag a Name on the builder instance: %s", err))
+		if err != nil {
+			err := fmt.Errorf("Error tagging source instance: %s", err)
+			state.Put("error", err)
+			ui.Error(err.Error())
+			return multistep.ActionHalt
+		}
 	}
 
 	if s.Debug {
@@ -346,7 +371,10 @@ func (s *StepRunSourceInstance) Cleanup(state multistep.StateBag) {
 			Target:  "cancelled",
 		}
 
-		WaitForState(&stateChange)
+		_, err := WaitForState(&stateChange)
+		if err != nil {
+			ui.Error(err.Error())
+		}
 
 	}
 
@@ -363,41 +391,9 @@ func (s *StepRunSourceInstance) Cleanup(state multistep.StateBag) {
 			Target:  "terminated",
 		}
 
-		WaitForState(&stateChange)
+		_, err := WaitForState(&stateChange)
+		if err != nil {
+			ui.Error(err.Error())
+		}
 	}
-}
-
-func WaitUntilSecurityGroupExists(c *ec2.EC2, input *ec2.DescribeSecurityGroupsInput) error {
-	waiterCfg := waiter.Config{
-		Operation:   "DescribeSecurityGroups",
-		Delay:       15,
-		MaxAttempts: 40,
-		Acceptors: []waiter.WaitAcceptor{
-			{
-				State:    "success",
-				Matcher:  "path",
-				Argument: "length(SecurityGroups[]) > `0`",
-				Expected: true,
-			},
-			{
-				State:    "retry",
-				Matcher:  "error",
-				Argument: "",
-				Expected: "InvalidGroup.NotFound",
-			},
-			{
-				State:    "retry",
-				Matcher:  "error",
-				Argument: "",
-				Expected: "InvalidSecurityGroupID.NotFound",
-			},
-		},
-	}
-
-	w := waiter.Waiter{
-		Client: c,
-		Input:  input,
-		Config: waiterCfg,
-	}
-	return w.Wait()
 }

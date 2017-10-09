@@ -4,12 +4,15 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
+
+	"crypto/x509"
+	"io/ioutil"
 
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/go-cleanhttp"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // AccessConfig is for common configuration related to openstack access
@@ -26,6 +29,9 @@ type AccessConfig struct {
 	Region           string `mapstructure:"region"`
 	EndpointType     string `mapstructure:"endpoint_type"`
 	TokenID          string `mapstructure:"token"`
+	CACertFile       string `mapstructure:"cacert"`
+	ClientCertFile   string `mapstructure:"cert"`
+	ClientKeyFile    string `mapstructure:"key"`
 
 	osClient *gophercloud.ProviderClient
 }
@@ -54,6 +60,15 @@ func (c *AccessConfig) Prepare(ctx *interpolate.Context) []error {
 	}
 	if c.Username == "" {
 		c.Username = os.Getenv("SDK_USERNAME")
+	}
+	if c.CACertFile == "" {
+		c.CACertFile = os.Getenv("OS_CACERT")
+	}
+	if c.ClientCertFile == "" {
+		c.ClientCertFile = os.Getenv("OS_CERT")
+	}
+	if c.ClientKeyFile == "" {
+		c.ClientKeyFile = os.Getenv("OS_KEY")
 	}
 
 	// Get as much as possible from the end
@@ -91,13 +106,36 @@ func (c *AccessConfig) Prepare(ctx *interpolate.Context) []error {
 		return []error{err}
 	}
 
+	tls_config := &tls.Config{}
+
+	if c.CACertFile != "" {
+		caCert, err := ioutil.ReadFile(c.CACertFile)
+		if err != nil {
+			return []error{err}
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tls_config.RootCAs = caCertPool
+	}
+
 	// If we have insecure set, then create a custom HTTP client that
 	// ignores SSL errors.
 	if c.Insecure {
-		config := &tls.Config{InsecureSkipVerify: true}
-		transport := &http.Transport{TLSClientConfig: config}
-		client.HTTPClient.Transport = transport
+		tls_config.InsecureSkipVerify = true
 	}
+
+	if c.ClientCertFile != "" && c.ClientKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(c.ClientCertFile, c.ClientKeyFile)
+		if err != nil {
+			return []error{err}
+		}
+
+		tls_config.Certificates = []tls.Certificate{cert}
+	}
+
+	transport := cleanhttp.DefaultTransport()
+	transport.TLSClientConfig = tls_config
+	client.HTTPClient.Transport = transport
 
 	// Auth
 	err = openstack.Authenticate(client, ao)

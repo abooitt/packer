@@ -10,11 +10,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/go-vnc"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
 	"os"
 )
 
@@ -72,9 +72,11 @@ func (s *stepTypeBootCommand) Run(state multistep.StateBag) multistep.StepAction
 
 	log.Printf("Connected to VNC desktop: %s", c.DesktopName)
 
+	hostIP := "10.0.2.2"
+	common.SetHTTPIP(hostIP)
 	ctx := config.ctx
 	ctx.Data = &bootCommandTemplateData{
-		"10.0.2.2",
+		hostIP,
 		httpPort,
 		config.VMName,
 	}

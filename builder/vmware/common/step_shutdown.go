@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/hashicorp/packer/packer"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"log"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -57,14 +56,6 @@ func (s *StepShutdown) Run(state multistep.StateBag) multistep.StepAction {
 			return multistep.ActionHalt
 		}
 
-		// Wait for the command to run so we can print std{err,out}
-		// We don't care if the command errored, since we'll notice
-		// if the vm didn't shut down.
-		cmd.Wait()
-
-		log.Printf("Shutdown stdout: %s", stdout.String())
-		log.Printf("Shutdown stderr: %s", stderr.String())
-
 		// Wait for the machine to actually shut down
 		log.Printf("Waiting max %s for shutdown to complete", s.Timeout)
 		shutdownTimer := time.After(s.Timeout)
@@ -76,6 +67,8 @@ func (s *StepShutdown) Run(state multistep.StateBag) multistep.StepAction {
 
 			select {
 			case <-shutdownTimer:
+				log.Printf("Shutdown stdout: %s", stdout.String())
+				log.Printf("Shutdown stderr: %s", stderr.String())
 				err := errors.New("Timeout while waiting for machine to shut down.")
 				state.Put("error", err)
 				ui.Error(err.Error())
@@ -131,10 +124,10 @@ LockWaitLoop:
 		}
 	}
 
-	if runtime.GOOS != "darwin" && !s.Testing {
+	if !s.Testing {
 		// Windows takes a while to yield control of the files when the
-		// process is exiting. Ubuntu will yield control of the files but
-		// VMWare may overwrite the VMX cleanup steps that run after this,
+		// process is exiting. Ubuntu and OS X will yield control of the files
+		// but VMWare may overwrite the VMX cleanup steps that run after this,
 		// so we wait to ensure VMWare has exited and flushed the VMX.
 
 		// We just sleep here. In the future, it'd be nice to find a better

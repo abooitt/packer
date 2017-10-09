@@ -11,11 +11,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/go-vnc"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
 )
 
 const KeyLeftShift uint32 = 0xFFE1
@@ -95,7 +95,7 @@ func (s *StepTypeBootCommand) Run(state multistep.StateBag) multistep.StepAction
 		ipFinder = &IfconfigIPFinder{Device: "vmnet8"}
 	}
 
-	hostIp, err := ipFinder.HostIP()
+	hostIP, err := ipFinder.HostIP()
 	if err != nil {
 		err := fmt.Errorf("Error detecting host IP: %s", err)
 		state.Put("error", err)
@@ -103,10 +103,11 @@ func (s *StepTypeBootCommand) Run(state multistep.StateBag) multistep.StepAction
 		return multistep.ActionHalt
 	}
 
-	log.Printf("Host IP for the VMware machine: %s", hostIp)
+	log.Printf("Host IP for the VMware machine: %s", hostIP)
+	common.SetHTTPIP(hostIP)
 
 	s.Ctx.Data = &bootCommandTemplateData{
-		hostIp,
+		hostIP,
 		httpPort,
 		s.VMName,
 	}

@@ -8,9 +8,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
 )
 
 const KeyLeftShift uint32 = 0xFFE1
@@ -49,8 +50,10 @@ func (s *StepTypeBootCommand) Run(state multistep.StateBag) multistep.StepAction
 		pauseFn = state.Get("pauseFn").(multistep.DebugPauseFn)
 	}
 
+	hostIP := "10.0.2.2"
+	common.SetHTTPIP(hostIP)
 	s.Ctx.Data = &bootCommandTemplateData{
-		"10.0.2.2",
+		hostIP,
 		httpPort,
 		s.VMName,
 	}
